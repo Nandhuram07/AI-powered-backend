@@ -1,8 +1,7 @@
 // src/conversation/chatAgent.ts
 import inquirer from 'inquirer';
 import chalk from 'chalk';
-import ora from 'ora';
-import { callAI } from '../utils/aiProvider.js';
+import { streamAI } from '../utils/aiProvider.js';
 import type { SystemInput, EntityDef, Relation, Feature, DbType, Field } from '../types/index.js';
 
 interface Message {
@@ -82,24 +81,22 @@ export async function startChat(
 
     history.push({ role: 'user', content: input });
 
-    // ── Call AI ───────────────────────────────────────────────
-    const spin = ora({ text: chalk.cyan('Thinking...'), color: 'cyan' }).start();
+    // ── Stream AI response ────────────────────────────────────
+    process.stdout.write('\n' + chalk.bold.cyan('Assistant:') + ' ');
 
-    const conversation = history
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-      .join('\n\n');
-
-    let aiResponse: string;
+    let aiResponse = '';
     try {
-      aiResponse = await callAI(SYSTEM_PROMPT, conversation);
+      for await (const chunk of streamAI(SYSTEM_PROMPT, history.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n'))) {
+        process.stdout.write(chunk);
+        aiResponse += chunk;
+      }
     } catch (err: unknown) {
-      spin.fail('AI call failed');
-      console.log(chalk.red(err instanceof Error ? err.message : String(err)));
+      console.log('\n' + chalk.red('AI call failed: ' + (err instanceof Error ? err.message : String(err))));
       history.pop();
       continue;
     }
 
-    spin.stop();
+    console.log('\n');
 
     // ── Try to parse JSON schema ──────────────────────────────
     const jsonMatch = aiResponse.match(/```json\s*([\s\S]+?)\s*```/);
@@ -108,7 +105,6 @@ export async function startChat(
         const parsed = JSON.parse(jsonMatch[1]) as ExtractedSchema;
         if (parsed.ready && parsed.entities?.length > 0) {
           extracted = parsed;
-          console.log('\n' + chalk.bold.cyan('Assistant:') + formatSummary(parsed));
           break;
         }
       } catch {
@@ -116,10 +112,10 @@ export async function startChat(
       }
     }
 
-    // ── Normal conversational reply ───────────────────────────
-    const clean = aiResponse.replace(/```json[\s\S]*?```/g, '').trim();
-    console.log('\n' + chalk.bold.cyan('Assistant:') + ' ' + clean + '\n');
-    history.push({ role: 'assistant', content: clean });
+    // ── Add to history if not JSON ────────────────────────────
+    if (!jsonMatch) {
+      history.push({ role: 'assistant', content: aiResponse });
+    }
   }
 
   // ── Build SystemInput ─────────────────────────────────────
