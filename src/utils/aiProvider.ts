@@ -6,15 +6,16 @@ dotenv.config();
 
 const provider = (process.env.AI_PROVIDER ?? 'groq').toLowerCase() as AIProvider;
 
-// ── Public entry point ────────────────────────────────────────
-export async function callAI(
+// ── Public entry point for streaming ────────────────────────────────────────
+export async function* streamAI(
   systemPrompt: string,
   userPrompt: string,
   retries: number = 4
-): Promise<string> {
+): AsyncGenerator<string, void, unknown> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      return await dispatch(systemPrompt, userPrompt);
+      yield* dispatchStream(systemPrompt, userPrompt);
+      return;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       const is429 =
@@ -32,26 +33,39 @@ export async function callAI(
       }
     }
   }
-  throw new Error('callAI: exhausted all retries');
+  throw new Error('streamAI: exhausted all retries');
+}
+
+// ── Keep old API for backwards compatibility ────────────────────────────────
+export async function callAI(
+  systemPrompt: string,
+  userPrompt: string,
+  retries: number = 4
+): Promise<string> {
+  let result = '';
+  for await (const chunk of streamAI(systemPrompt, userPrompt, retries)) {
+    result += chunk;
+  }
+  return result;
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function dispatch(systemPrompt: string, userPrompt: string): Promise<string> {
+function dispatchStream(systemPrompt: string, userPrompt: string): AsyncGenerator<string, void, unknown> {
   switch (provider) {
-    case 'groq':      return callGroq(systemPrompt, userPrompt);
-    case 'gemini':    return callGemini(systemPrompt, userPrompt);
-    case 'anthropic': return callAnthropic(systemPrompt, userPrompt);
-    case 'openai':    return callOpenAI(systemPrompt, userPrompt);
+    case 'groq':      return streamGroq(systemPrompt, userPrompt);
+    case 'gemini':    return streamGemini(systemPrompt, userPrompt);
+    case 'anthropic': return streamAnthropic(systemPrompt, userPrompt);
+    case 'openai':    return streamOpenAI(systemPrompt, userPrompt);
     default:
       throw new Error(`Unknown AI_PROVIDER: "${provider}". Use groq | gemini | anthropic | openai`);
   }
 }
 
 // ── Groq ──────────────────────────────────────────────────────
-async function callGroq(system: string, user: string): Promise<string> {
+async function* streamGroq(system: string, user: string): AsyncGenerator<string, void, unknown> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY is not set in .env');
 
@@ -63,6 +77,7 @@ async function callGroq(system: string, user: string): Promise<string> {
       model,
       max_tokens: 8192,
       temperature: 0.2,
+      stream: true,
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
     }),
   });
@@ -72,19 +87,35 @@ async function callGroq(system: string, user: string): Promise<string> {
     throw new Error(`Groq API error (${res.status}): ${err?.error?.message ?? res.statusText}`);
   }
 
-  const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
-  const text = data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error('Groq returned an empty response.');
-  return text;
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('No response body from Groq');
+
+  const decoder = new TextDecoder();
+  for await (const chunk of readStream(reader)) {
+    const text = decoder.decode(chunk, { stream: true });
+    for (const line of text.split('\n')) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+        try {
+          const parsed = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) yield content;
+        } catch {
+          // skip invalid json lines
+        }
+      }
+    }
+  }
 }
 
 // ── Gemini ────────────────────────────────────────────────────
-async function callGemini(system: string, user: string): Promise<string> {
+async function* streamGemini(system: string, user: string): AsyncGenerator<string, void, unknown> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set in .env');
 
   const model = process.env.GEMINI_MODEL ?? 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}`;
 
   const res = await fetch(url, {
     method: 'POST',
@@ -101,14 +132,28 @@ async function callGemini(system: string, user: string): Promise<string> {
     throw new Error(`Gemini API error (${res.status}): ${err?.error?.message ?? res.statusText}`);
   }
 
-  const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Gemini returned an empty response.');
-  return text;
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('No response body from Gemini');
+
+  const decoder = new TextDecoder();
+  for await (const chunk of readStream(reader)) {
+    const text = decoder.decode(chunk, { stream: true });
+    for (const line of text.split('\n')) {
+      if (line.trim()) {
+        try {
+          const parsed = JSON.parse(line) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+          const content = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (content) yield content;
+        } catch {
+          // skip invalid json lines
+        }
+      }
+    }
+  }
 }
 
 // ── Anthropic ─────────────────────────────────────────────────
-async function callAnthropic(system: string, user: string): Promise<string> {
+async function* streamAnthropic(system: string, user: string): AsyncGenerator<string, void, unknown> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set in .env');
 
@@ -116,20 +161,22 @@ async function callAnthropic(system: string, user: string): Promise<string> {
   const client = new Anthropic({ apiKey });
   const model = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-20250514';
 
-  const response = await client.messages.create({
+  const stream = await client.messages.stream({
     model,
     max_tokens: 4096,
     system,
     messages: [{ role: 'user', content: user }],
   });
 
-  const block = response.content[0];
-  if (block.type !== 'text') throw new Error('Anthropic returned non-text response');
-  return block.text;
+  for await (const chunk of stream) {
+    if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
+      yield chunk.delta.text;
+    }
+  }
 }
 
 // ── OpenAI ────────────────────────────────────────────────────
-async function callOpenAI(system: string, user: string): Promise<string> {
+async function* streamOpenAI(system: string, user: string): AsyncGenerator<string, void, unknown> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY is not set in .env');
 
@@ -137,13 +184,28 @@ async function callOpenAI(system: string, user: string): Promise<string> {
   const client = new OpenAI({ apiKey });
   const model = process.env.OPENAI_MODEL ?? 'gpt-4o';
 
-  const response = await client.chat.completions.create({
+  const stream = await client.chat.completions.create({
     model,
     max_tokens: 4096,
+    stream: true,
     messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
   });
 
-  const text = response.choices[0]?.message?.content;
-  if (!text) throw new Error('OpenAI returned an empty response.');
-  return text;
+  for await (const chunk of stream) {
+    const content = chunk.choices[0]?.delta?.content;
+    if (content) yield content;
+  }
+}
+
+// ── Helper to read from ReadableStream ─────────────────────────
+async function* readStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<Uint8Array, void, unknown> {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
